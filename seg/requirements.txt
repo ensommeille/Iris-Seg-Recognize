@@ -1,0 +1,14 @@
+torch>=1.13.0
+torchvision>=0.14.0
+numpy
+opencv-python
+tqdm
+albumentations
+Pillow
+matplotlib
+
+# Optional dependency for ONNX model support
+# For CPU-only ONNX inference:
+# onnxruntime==1.20.1
+# For GPU-accelerated ONNX inference (requires CUDA 12.x and cuDNN 9.x):
+# onnxruntime-gpu==1.20.1

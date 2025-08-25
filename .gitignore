@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Caches
+.cache/
+.mypy_cache/
+.pytest_cache/
+
+# Logs / TensorBoard
+logs/
+**/logs/
+runs/
+
+# Outputs / Checkpoints
+outputs/
+checkpoints/
+*.pth
+*.pt
+*.onnx
+*.pkl
+
+# Data (ignore raw data; keep directory)
+data/
+!data/.gitkeep
+
+# Build
+build/
+dist/
+*.egg-info/
