@@ -17,11 +17,18 @@ from utils.losses import CombinedRecognitionLoss
 from utils.dataset import build_recognition_datasets
 
 
-def accuracy(outputs, labels):
-    """计算分类准确率"""
-    _, predicted = torch.max(outputs, 1)
-    correct = (predicted == labels).sum().item()
-    return correct / labels.size(0)
+def topk_accuracy(outputs, labels, ks=(1,5)):
+    """计算Top-k准确率，返回字典{1:acc1, 5:acc5}（k存在时）"""
+    maxk = max(ks)
+    _, pred = outputs.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(labels.view(1, -1).expand_as(pred))
+    res = {}
+    for k in ks:
+        if k <= outputs.size(1):
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res[k] = (correct_k.item() / labels.size(0))
+    return res
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
@@ -30,7 +37,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     total_loss = 0
     total_arcface_loss = 0
     total_triplet_loss = 0
-    total_acc = 0
+    total_top1 = 0
+    total_top5 = 0
     
     pbar = tqdm(dataloader, desc='Training')
     for batch_idx, (images, labels) in enumerate(pbar):
@@ -44,24 +52,28 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         optimizer.step()
         
         # 计算准确率
-        acc = accuracy(logits, labels)
+        accs = topk_accuracy(logits, labels, ks=(1,5))
+        acc1 = accs.get(1, 0.0)
+        acc5 = accs.get(5, 0.0)
         
         total_loss += loss.item()
         total_arcface_loss += arcface_loss.item()
         total_triplet_loss += triplet_loss.item()
-        total_acc += acc
+        total_top1 += acc1
+        total_top5 += acc5
         
         pbar.set_postfix({
             'Loss': f'{loss.item():.4f}',
             'ArcFace': f'{arcface_loss.item():.4f}',
             'Triplet': f'{triplet_loss.item():.4f}',
-            'Acc': f'{acc:.4f}'
+            'Top1': f'{acc1:.6f}',
+            'Top5': f'{acc5:.6f}'
         })
     
     return (total_loss / len(dataloader), 
             total_arcface_loss / len(dataloader),
             total_triplet_loss / len(dataloader),
-            total_acc / len(dataloader))
+            total_top1 / len(dataloader), total_top5 / len(dataloader))
 
 
 def validate_epoch(model, dataloader, criterion, device):
@@ -70,7 +82,8 @@ def validate_epoch(model, dataloader, criterion, device):
     total_loss = 0
     total_arcface_loss = 0
     total_triplet_loss = 0
-    total_acc = 0
+    total_top1 = 0
+    total_top5 = 0
     
     with torch.no_grad():
         pbar = tqdm(dataloader, desc='Validation')
@@ -82,24 +95,28 @@ def validate_epoch(model, dataloader, criterion, device):
             loss, arcface_loss, triplet_loss = criterion(logits, embeddings, labels)
             
             # 计算准确率
-            acc = accuracy(logits, labels)
+            accs = topk_accuracy(logits, labels, ks=(1,5))
+            acc1 = accs.get(1, 0.0)
+            acc5 = accs.get(5, 0.0)
             
             total_loss += loss.item()
             total_arcface_loss += arcface_loss.item()
             total_triplet_loss += triplet_loss.item()
-            total_acc += acc
+            total_top1 += acc1
+            total_top5 += acc5
             
             pbar.set_postfix({
                 'Loss': f'{loss.item():.4f}',
                 'ArcFace': f'{arcface_loss.item():.4f}',
                 'Triplet': f'{triplet_loss.item():.4f}',
-                'Acc': f'{acc:.4f}'
+                'Top1': f'{acc1:.6f}',
+                'Top5': f'{acc5:.6f}'
             })
     
     return (total_loss / len(dataloader), 
             total_arcface_loss / len(dataloader),
             total_triplet_loss / len(dataloader),
-            total_acc / len(dataloader))
+            total_top1 / len(dataloader), total_top5 / len(dataloader))
 
 
 def save_checkpoint(model, optimizer, epoch, best_metric, save_path):
@@ -117,10 +134,10 @@ def main():
     parser = argparse.ArgumentParser(description='Train Iris Recognition Model')
     parser.add_argument('--data_root', type=str, default='data', help='Data root directory')
     parser.add_argument('--output_dir', type=str, default='outputs/recognition', help='Output directory')
-    parser.add_argument('--img_size', type=int, default=224, help='Input image size')
+    parser.add_argument('--img_size', type=int, default=256, help='Input image size')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
     parser.add_argument('--val_split', type=float, default=0.1, help='Validation split ratio')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of workers')
@@ -132,6 +149,8 @@ def main():
     parser.add_argument('--triplet_weight', type=float, default=0.5, help='Triplet loss weight')
     parser.add_argument('--triplet_margin', type=float, default=0.2, help='Triplet loss margin')
     parser.add_argument('--use_mask', action='store_true', help='Use segmentation mask')
+    parser.add_argument('--resume', type=str, default='', help='Path to checkpoint to resume training (model+optimizer+epoch)')
+    parser.add_argument('--init_model', type=str, default='', help='Init model weights from checkpoint (model only, epoch=0)')
     
     args = parser.parse_args()
     
@@ -173,7 +192,7 @@ def main():
     
     print(f'Train samples: {len(train_dataset)}')
     print(f'Val samples: {len(val_dataset)}')
-    print(f'Number of classes: {train_dataset.get_num_classes()}')
+    print(f'Number of classes (person-eye): {train_dataset.get_num_classes()}')
     
     # 构建模型
     print('Building model...')
@@ -185,11 +204,22 @@ def main():
     )
     model = model.to(device)
     
-    # 损失函数和优化器
+    # Extended ArcFace warmup schedule
+    # 0–5: margin=0.0, scale=16; 6–10: margin=0.2, scale=20; >=11: margin=0.4, scale=28
+    def apply_arcface_warmup(current_epoch: int):
+        if current_epoch <= 5:
+            model.arcface_head.set_params(scale=16.0, margin=0.0)
+        elif current_epoch <= 10:
+            model.arcface_head.set_params(scale=20.0, margin=0.2)
+        else:
+            model.arcface_head.set_params(scale=28.0, margin=0.4)
+    
+    # 损失函数和优化器（ArcFace 启用 label smoothing）
     criterion = CombinedRecognitionLoss(
         arcface_weight=args.arcface_weight,
         triplet_weight=args.triplet_weight,
-        triplet_margin=args.triplet_margin
+        triplet_margin=args.triplet_margin,
+        label_smoothing=0.1
     )
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
@@ -197,25 +227,60 @@ def main():
     # TensorBoard
     writer = SummaryWriter(os.path.join(args.output_dir, 'logs'))
     
-    # 训练循环
+    # 恢复/初始化权重
+    start_epoch = 0
     best_acc = 0.0
+    if args.resume and os.path.isfile(args.resume):
+        print(f'Resuming from checkpoint: {args.resume}')
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt.get('model_state_dict', ckpt))
+        if 'optimizer_state_dict' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        best_acc = ckpt.get('best_metric', 0.0)
+        start_epoch = ckpt.get('epoch', -1) + 1
+        print(f'Resumed at epoch {start_epoch}, best_acc={best_acc:.6f}')
+    elif args.init_model and os.path.isfile(args.init_model):
+        print(f'Initializing model weights from: {args.init_model}')
+        ckpt = torch.load(args.init_model, map_location=device)
+        model.load_state_dict(ckpt.get('model_state_dict', ckpt))
+        start_epoch = 0
+        best_acc = 0.0
+    
+    # 训练循环
     print('Starting training...')
     
-    for epoch in range(args.epochs):
-        print(f'\nEpoch {epoch+1}/{args.epochs}')
+    # Freeze backbone for first few epochs and ramp triplet weight
+    freeze_backbone_epochs = 5
+    for epoch in range(start_epoch, start_epoch + args.epochs):
+        print(f'\nEpoch {epoch+1}/{start_epoch + args.epochs}')
+        apply_arcface_warmup(epoch)
+        if epoch < freeze_backbone_epochs:
+            for p in model.backbone.features.parameters():
+                p.requires_grad = False
+        elif epoch == freeze_backbone_epochs:
+            for p in model.backbone.features.parameters():
+                p.requires_grad = True
+        
+        # Triplet weight schedule
+        if epoch < 5:
+            criterion.triplet_weight = 0.1
+        elif epoch < 10:
+            criterion.triplet_weight = 0.3
+        else:
+            criterion.triplet_weight = args.triplet_weight
         
         # 训练
-        train_loss, train_arcface, train_triplet, train_acc = train_epoch(
+        train_loss, train_arcface, train_triplet, train_top1, train_top5 = train_epoch(
             model, train_loader, criterion, optimizer, device
         )
         
         # 验证
-        val_loss, val_arcface, val_triplet, val_acc = validate_epoch(
+        val_loss, val_arcface, val_triplet, val_top1, val_top5 = validate_epoch(
             model, val_loader, criterion, device
         )
         
         # 学习率调度
-        scheduler.step(val_acc)
+        scheduler.step(val_top1)
         
         # 记录到TensorBoard
         writer.add_scalar('Loss/Train', train_loss, epoch)
@@ -224,16 +289,18 @@ def main():
         writer.add_scalar('ArcFace/Val', val_arcface, epoch)
         writer.add_scalar('Triplet/Train', train_triplet, epoch)
         writer.add_scalar('Triplet/Val', val_triplet, epoch)
-        writer.add_scalar('Accuracy/Train', train_acc, epoch)
-        writer.add_scalar('Accuracy/Val', val_acc, epoch)
+        writer.add_scalar('AccuracyTop1/Train', train_top1, epoch)
+        writer.add_scalar('AccuracyTop1/Val', val_top1, epoch)
+        writer.add_scalar('AccuracyTop5/Train', train_top5, epoch)
+        writer.add_scalar('AccuracyTop5/Val', val_top5, epoch)
         writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
         
-        print(f'Train - Loss: {train_loss:.4f}, ArcFace: {train_arcface:.4f}, Triplet: {train_triplet:.4f}, Acc: {train_acc:.4f}')
-        print(f'Val   - Loss: {val_loss:.4f}, ArcFace: {val_arcface:.4f}, Triplet: {val_triplet:.4f}, Acc: {val_acc:.4f}')
+        print(f'Train - Loss: {train_loss:.4f}, ArcFace: {train_arcface:.4f}, Triplet: {train_triplet:.4f}, Top1: {train_top1:.6f}, Top5: {train_top5:.6f}')
+        print(f'Val   - Loss: {val_loss:.4f}, ArcFace: {val_arcface:.4f}, Triplet: {val_triplet:.4f}, Top1: {val_top1:.6f}, Top5: {val_top5:.6f}')
         
         # 保存最佳模型
-        if val_acc > best_acc:
-            best_acc = val_acc
+        if val_top1 > best_acc:
+            best_acc = val_top1
             save_checkpoint(
                 model, optimizer, epoch, best_acc,
                 os.path.join(args.output_dir, 'best_model.pth')
@@ -259,7 +326,7 @@ def main():
     with open(os.path.join(args.output_dir, 'person_ids.json'), 'w') as f:
         json.dump(person_ids, f, indent=2)
     
-    print(f'\nTraining completed! Best Acc: {best_acc:.4f}')
+    print(f'\nTraining completed! Best Top1 Acc: {best_acc:.6f}')
     writer.close()
 
 

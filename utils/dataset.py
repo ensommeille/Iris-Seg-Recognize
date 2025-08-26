@@ -144,7 +144,7 @@ class IrisSegmentationDataset(Dataset):
 
 class IrisRecognitionDataset(Dataset):
     """虹膜识别数据集"""
-    def __init__(self, images, masks, info, img_size=224, augment=False, use_mask=True):
+    def __init__(self, images, masks, info, img_size=256, augment=False, use_mask=True, person_to_label=None):
         self.images = images
         self.masks = masks
         self.info = info
@@ -152,16 +152,20 @@ class IrisRecognitionDataset(Dataset):
         self.augment = augment
         self.use_mask = use_mask
         
-        # 创建人员ID到索引的映射
-        self.person_to_indices = defaultdict(list)
-        for i, info_item in enumerate(info):
-            person_id = info_item['person_id']
-            if person_id is not None:
-                self.person_to_indices[person_id].append(i)
-        
-        # 获取所有人员ID
-        self.person_ids = list(self.person_to_indices.keys())
-        self.person_to_label = {pid: idx for idx, pid in enumerate(self.person_ids)}
+        # 如果提供了全局的 person_to_label，则直接使用；否则根据本数据构建
+        if person_to_label is not None:
+            self.person_to_label = dict(person_to_label)
+            self.person_ids = list(self.person_to_label.keys())
+        else:
+            self.person_to_indices = defaultdict(list)
+            for i, info_item in enumerate(info):
+                person_id = info_item['person_id']
+                eye_type = info_item.get('eye_type')
+                if person_id is not None and eye_type is not None:
+                    combined_id = f"{person_id}_{eye_type}"
+                    self.person_to_indices[combined_id].append(i)
+            self.person_ids = list(self.person_to_indices.keys())
+            self.person_to_label = {pid: idx for idx, pid in enumerate(self.person_ids)}
         
         if augment:
             self.transform = A.Compose([
@@ -218,10 +222,12 @@ class IrisRecognitionDataset(Dataset):
         # 转换为tensor
         img = img.transpose(2, 0, 1).astype('float32')
         
-        # 获取标签
+        # 获取标签（基于人员-眼睛组合）
         person_id = info_item['person_id']
-        if person_id in self.person_to_label:
-            label = self.person_to_label[person_id]
+        eye_type = info_item.get('eye_type')
+        combined_id = f"{person_id}_{eye_type}" if (person_id is not None and eye_type is not None) else None
+        if combined_id in self.person_to_label:
+            label = self.person_to_label[combined_id]
         else:
             label = 0  # 默认标签
         
@@ -262,7 +268,7 @@ def build_segmentation_datasets(data_root, img_size=256, val_split=0.1, seed=42)
     return train_dataset, val_dataset
 
 
-def build_recognition_datasets(data_root, img_size=224, val_split=0.1, seed=42, use_mask=True):
+def build_recognition_datasets(data_root, img_size=256, val_split=0.1, seed=42, use_mask=True):
     """构建识别数据集"""
     paired_imgs, paired_masks, paired_info = collect_pairs(data_root)
     
@@ -275,6 +281,20 @@ def build_recognition_datasets(data_root, img_size=224, val_split=0.1, seed=42, 
     
     # 确保每个人员都有足够的样本
     valid_persons = {pid: indices for pid, indices in person_to_indices.items() if len(indices) >= 2}
+    
+    # 统一构建全局的 person-eye -> label 映射，确保 train/val 一致
+    combined_ids_all = []
+    for pid, indices in valid_persons.items():
+        # 收集此人的左右眼组合ID
+        eyes = set()
+        for idx in indices:
+            eye = paired_info[idx].get('eye_type')
+            if eye is not None:
+                eyes.add(eye)
+        for eye in sorted(list(eyes)):
+            combined_ids_all.append(f"{pid}_{eye}")
+    combined_ids_all = sorted(list(set(combined_ids_all)))
+    global_person_to_label = {cid: i for i, cid in enumerate(combined_ids_all)}
     
     train_indices = []
     val_indices = []
@@ -290,12 +310,12 @@ def build_recognition_datasets(data_root, img_size=224, val_split=0.1, seed=42, 
     train_imgs = [paired_imgs[i] for i in train_indices]
     train_masks = [paired_masks[i] for i in train_indices]
     train_info = [paired_info[i] for i in train_indices]
-    train_dataset = IrisRecognitionDataset(train_imgs, train_masks, train_info, img_size, augment=True, use_mask=use_mask)
+    train_dataset = IrisRecognitionDataset(train_imgs, train_masks, train_info, img_size, augment=True, use_mask=use_mask, person_to_label=global_person_to_label)
     
     # 构建验证集
     val_imgs = [paired_imgs[i] for i in val_indices]
     val_masks = [paired_masks[i] for i in val_indices]
     val_info = [paired_info[i] for i in val_indices]
-    val_dataset = IrisRecognitionDataset(val_imgs, val_masks, val_info, img_size, augment=False, use_mask=use_mask)
+    val_dataset = IrisRecognitionDataset(val_imgs, val_masks, val_info, img_size, augment=False, use_mask=use_mask, person_to_label=global_person_to_label)
     
     return train_dataset, val_dataset

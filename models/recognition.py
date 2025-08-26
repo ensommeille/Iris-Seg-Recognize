@@ -6,6 +6,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+try:
+    from torchvision.models import MobileNet_V3_Large_Weights, MobileNet_V2_Weights
+except Exception:
+    MobileNet_V3_Large__weights = None
+    MobileNet_V2_Weights = None
 import math
 
 
@@ -23,10 +28,21 @@ class ArcMarginProduct(nn.Module):
         nn.init.xavier_uniform_(self.weight)
         
         self.easy_margin = easy_margin
-        self.cos_m = math.cos(margin)
-        self.sin_m = math.sin(margin)
-        self.th = math.cos(math.pi - margin)
-        self.mm = math.sin(math.pi - margin) * margin
+        self._update_cached_trig()
+
+    def _update_cached_trig(self):
+        self.cos_m = math.cos(self.margin)
+        self.sin_m = math.sin(self.margin)
+        self.th = math.cos(math.pi - self.margin)
+        self.mm = math.sin(math.pi - self.margin) * self.margin
+
+    def set_params(self, scale: float | None = None, margin: float | None = None):
+        """Dynamically update scale and/or margin during training."""
+        if scale is not None:
+            self.scale = float(scale)
+        if margin is not None:
+            self.margin = float(margin)
+            self._update_cached_trig()
 
     def forward(self, input, label):
         # normalize features and weights
@@ -71,17 +87,29 @@ class IrisRecognitionModel(nn.Module):
         # Backbone
         if backbone == 'mobilenet_v3':
             try:
-                self.backbone = models.mobilenet_v3_large(pretrained=pretrained)
+                if 'MobileNet_V3_Large_Weights' in globals() and MobileNet_V3_Large_Weights is not None:
+                    weights = MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
+                    self.backbone = models.mobilenet_v3_large(weights=weights)
+                else:
+                    self.backbone = models.mobilenet_v3_large(pretrained=pretrained)
                 # Remove classifier
                 self.backbone.classifier = nn.Identity()
                 backbone_features = 960
             except Exception:
                 # Fallback to MobileNetV2
-                self.backbone = models.mobilenet_v2(pretrained=pretrained)
+                if 'MobileNet_V2_Weights' in globals() and MobileNet_V2_Weights is not None:
+                    weights = MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
+                    self.backbone = models.mobilenet_v2(weights=weights)
+                else:
+                    self.backbone = models.mobilenet_v2(pretrained=pretrained)
                 self.backbone.classifier = nn.Identity()
                 backbone_features = 1280
         else:
-            self.backbone = models.mobilenet_v2(pretrained=pretrained)
+            if 'MobileNet_V2_Weights' in globals() and MobileNet_V2_Weights is not None:
+                weights = MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
+                self.backbone = models.mobilenet_v2(weights=weights)
+            else:
+                self.backbone = models.mobilenet_v2(pretrained=pretrained)
             self.backbone.classifier = nn.Identity()
             backbone_features = 1280
         
@@ -110,13 +138,13 @@ class IrisRecognitionModel(nn.Module):
         # Normalize embeddings for cosine similarity
         embeddings_norm = F.normalize(embeddings, dim=1)
         
-        if self.training and labels is not None:
-            # Training mode with ArcFace
+        # If labels are provided, always compute ArcFace logits (works for train and eval)
+        if labels is not None:
             logits = self.arcface_head(embeddings_norm, labels)
             return logits, embeddings_norm
-        else:
-            # Inference mode - return embeddings only
-            return embeddings_norm
+        
+        # Otherwise return embeddings only
+        return embeddings_norm
 
 
 def build_recognition_model(num_classes, embedding_size=512, pretrained=True, backbone='mobilenet_v3'):

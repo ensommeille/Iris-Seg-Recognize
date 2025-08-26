@@ -6,6 +6,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+try:
+    from torchvision.models import MobileNet_V3_Large_Weights, MobileNet_V2_Weights
+except Exception:
+    MobileNet_V3_Large_Weights = None
+    MobileNet_V2_Weights = None
 
 
 class ConvBNReLU(nn.Sequential):
@@ -146,7 +151,11 @@ class IrisSegmentationModel(nn.Module):
         used_mb = None
         if try_mbv3:
             try:
-                mb = models.mobilenet_v3_large(pretrained=pretrained)
+                if MobileNet_V3_Large_Weights is not None:
+                    weights = MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
+                    mb = models.mobilenet_v3_large(weights=weights)
+                else:
+                    mb = models.mobilenet_v3_large(pretrained=pretrained)
                 features = mb.features
                 self.initial = nn.Sequential(features[0])
                 self.enc1 = nn.Sequential(*features[1:3])
@@ -159,7 +168,11 @@ class IrisSegmentationModel(nn.Module):
                 used_mb = None
 
         if used_mb is None:
-            mb = models.mobilenet_v2(pretrained=pretrained)
+            if MobileNet_V2_Weights is not None:
+                weights = MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
+                mb = models.mobilenet_v2(weights=weights)
+            else:
+                mb = models.mobilenet_v2(pretrained=pretrained)
             features = mb.features
             self.initial = features[0]
             self.enc1 = nn.Sequential(*features[1:3])

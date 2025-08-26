@@ -53,45 +53,78 @@ def segment_iris(model, image_tensor, device):
     return mask.cpu().numpy()[0, 0]
 
 
-def extract_embedding(model, image_tensor, mask=None, img_size=224):
+def extract_embedding(model, image_tensor, mask=None, img_size=256, device='cpu'):
     """提取特征嵌入"""
     import torch.nn.functional as F
     
-    # 如果有掩码，应用掩码
-    if mask is not None:
-        # 调整掩码大小
-        mask_resized = cv2.resize(mask, (img_size, img_size))
-        mask_tensor = torch.from_numpy(mask_resized).unsqueeze(0).unsqueeze(0)
-        
-        # 应用掩码
-        image_tensor = image_tensor * mask_tensor
+    # 确保图像张量在正确的设备上
+    image_tensor = image_tensor.to(device)
     
     # 调整图像大小用于识别
     if image_tensor.shape[-1] != img_size:
         image_tensor = F.interpolate(image_tensor, size=(img_size, img_size), mode='bilinear', align_corners=False)
     
+    # 如果有掩码，应用掩码
+    if mask is not None:
+        # 调整掩码大小
+        mask_resized = cv2.resize(mask, (img_size, img_size))
+        mask_tensor = torch.from_numpy(mask_resized).unsqueeze(0).unsqueeze(0).float().to(device)
+        
+        # 应用掩码
+        image_tensor = image_tensor * mask_tensor
+    
     with torch.no_grad():
-        embedding = model(image_tensor)
+        # 直接调用模型获取嵌入，不传入labels参数
+        embedding = model(image_tensor, labels=None)
     
     return embedding.cpu().numpy()[0]
 
 
+def list_images_recursive(root: str):
+    paths = []
+    for r, _, files in os.walk(root):
+        for fn in files:
+            low = fn.lower()
+            if low.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')):
+                paths.append(os.path.join(r, fn))
+    return sorted(paths)
+
+
+def parse_eval_filename(path: str):
+    """Parse filename like name + lowercase l/r + image id, e.g., alicel03.jpg -> (alice, 'L')."""
+    import re
+    base = os.path.basename(path)
+    m = re.match(r"^(.+?)([lr])(\d+)\.[^\.]+$", base)
+    if not m:
+        return None, None
+    person = m.group(1)
+    eye = m.group(2).upper()
+    return person, eye
+
+
 def main():
     parser = argparse.ArgumentParser(description='Build Iris Database')
-    parser.add_argument('--data_root', type=str, required=True, help='Data root directory')
+    parser.add_argument('--data_root', type=str, help='Data root directory')
+    parser.add_argument('--images_dir', type=str, help='Images directory only (e.g., data/eval/images)')
     parser.add_argument('--seg_model', type=str, required=True, help='Segmentation model path')
     parser.add_argument('--recog_model', type=str, required=True, help='Recognition model path')
-    parser.add_argument('--person_ids', type=str, required=True, help='Person IDs JSON file')
+    parser.add_argument('--person_ids', type=str, help='Person IDs JSON file (optional)')
     parser.add_argument('--output_path', type=str, required=True, help='Database output path')
-    parser.add_argument('--device', type=str, default='auto', help='Device to use')
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'], help='Device to use (auto/cpu/cuda)')
     
     args = parser.parse_args()
     
     # 设置设备
     if args.device == 'auto':
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    elif args.device == 'cuda':
+        if not torch.cuda.is_available():
+            print("CUDA is not available, falling back to CPU")
+            device = torch.device('cpu')
+        else:
+            device = torch.device('cuda')
     else:
-        device = torch.device(args.device)
+        device = torch.device('cpu')
     
     print(f'Using device: {device}')
     
@@ -105,11 +138,20 @@ def main():
     
     # 加载识别模型
     print('Loading recognition model...')
-    with open(args.person_ids, 'r') as f:
-        person_ids = json.load(f)
+    
+    # 确定类别数量
+    if args.person_ids and os.path.exists(args.person_ids):
+        with open(args.person_ids, 'r') as f:
+            person_ids = json.load(f)
+        num_classes = len(person_ids)
+        print(f'Using {num_classes} classes from person_ids.json')
+    else:
+        # 如果没有提供person_ids，使用默认值
+        num_classes = 2000
+        print(f'Using default {num_classes} classes')
     
     recog_model = build_recognition_model(
-        num_classes=len(person_ids),
+        num_classes=num_classes,
         embedding_size=512,
         pretrained=False
     )
@@ -120,45 +162,84 @@ def main():
     
     # 收集数据
     print('Collecting data...')
-    paired_imgs, paired_masks, paired_info = collect_pairs(args.data_root)
+    items = []  # tuples (img_path, person_id, eye_type)
+    if args.images_dir and os.path.isdir(args.images_dir):
+        img_files = list_images_recursive(args.images_dir)
+        for ip in img_files:
+            person, eye = parse_eval_filename(ip)
+            if person is None or eye is None:
+                continue
+            items.append((ip, person, eye))
+        print(f'Found {len(items)} images in images_dir')
+    else:
+        if not args.data_root:
+            raise ValueError('Provide --images_dir for eval-only images or --data_root for standard (images+masks) dataset')
+        paired_imgs, paired_masks, paired_info = collect_pairs(args.data_root)
+        for ip, mp, info in zip(paired_imgs, paired_masks, paired_info):
+            if info['person_id'] is None or info.get('eye_type') is None:
+                continue
+            items.append((ip, info['person_id'], info.get('eye_type')))
+        print(f'Found {len(items)} image-mask pairs in data_root')
     
     # 构建数据库
     print('Building database...')
     database = {}
     
-    for i, (img_path, mask_path, info) in enumerate(tqdm(zip(paired_imgs, paired_masks, paired_info), total=len(paired_imgs))):
-        person_id = info['person_id']
-        if person_id is None:
-            continue
+    for i, (img_path, person_id, eye_type) in enumerate(tqdm(items)):
         
         try:
             # 预处理图像
             img_tensor = preprocess_image(img_path, img_size=256)
             
-            # 分割虹膜
+            # 分割虹膜（若 eval-only 没有掩码，也统一用分割模型预测）
             mask = segment_iris(seg_model, img_tensor, device)
             
-            # 提取嵌入
-            embedding = extract_embedding(recog_model, img_tensor, mask, img_size=224)
+            # 提取嵌入（一致使用 256 尺寸）
+            embedding = extract_embedding(recog_model, img_tensor, mask, img_size=256, device=device)
             
-            # 存储到数据库
-            if person_id not in database:
-                database[person_id] = []
-            database[person_id].append(embedding)
+            # 存储到数据库（根据人员-眼睛区分）
+            combined_id = f"{person_id}_{eye_type}"
+            if combined_id not in database:
+                database[combined_id] = []
+            database[combined_id].append(embedding)
             
         except Exception as e:
             print(f'Error processing {img_path}: {e}')
             continue
     
-    # 计算每个人的平均嵌入
-    print('Computing average embeddings...')
-    for person_id in database:
-        embeddings = np.array(database[person_id])
-        database[person_id] = np.mean(embeddings, axis=0)
+    # 计算每个人的稳健平均嵌入（L2 归一化 + 以与中位数偏差>2σ为准的剔除）
+    print('Computing robust average embeddings...')
+    for person_id in list(database.keys()):
+        embeddings = np.asarray(database[person_id], dtype=np.float32)  # (N, D)
+        if embeddings.ndim != 2 or embeddings.shape[0] == 0:
+            continue
+        # L2 normalize each embedding
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12
+        emb_norm = embeddings / norms
+        # Median prototype (component-wise median), then normalize
+        med = np.median(emb_norm, axis=0)
+        med_norm = med / (np.linalg.norm(med) + 1e-12)
+        # Cosine similarity to median
+        sims = emb_norm @ med_norm  # (N,)
+        med_s = float(np.median(sims))
+        std_s = float(np.std(sims))
+        if std_s == 0.0:
+            inlier_mask = np.ones_like(sims, dtype=bool)
+        else:
+            # Keep samples with |sim - median| <= 2*std
+            inlier_mask = np.abs(sims - med_s) <= (2.0 * std_s)
+        inliers = emb_norm[inlier_mask]
+        if inliers.shape[0] == 0:
+            inliers = emb_norm  # fallback to all
+        avg = inliers.mean(axis=0)
+        avg = avg / (np.linalg.norm(avg) + 1e-12)
+        database[person_id] = avg.astype(np.float32)
     
     # 保存数据库
     print(f'Saving database to {args.output_path}...')
-    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+    dirpath = os.path.dirname(args.output_path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
     with open(args.output_path, 'wb') as f:
         pickle.dump(database, f)
     

@@ -106,24 +106,24 @@ class TripletLoss(nn.Module):
 
 
 class ArcFaceLoss(nn.Module):
-    """ArcFace Loss"""
-    def __init__(self, scale=30.0, margin=0.5):
+    """ArcFace Loss with optional label smoothing"""
+    def __init__(self, scale=30.0, margin=0.5, label_smoothing: float = 0.0):
         super().__init__()
         self.scale = scale
         self.margin = margin
+        self.label_smoothing = float(label_smoothing)
         
     def forward(self, logits, labels):
-        """Standard cross entropy loss for ArcFace logits"""
-        return F.cross_entropy(logits, labels)
+        return F.cross_entropy(logits, labels, label_smoothing=self.label_smoothing if self.label_smoothing > 0 else 0.0)
 
 
 class CombinedRecognitionLoss(nn.Module):
     """组合识别损失函数：ArcFace + Triplet"""
-    def __init__(self, arcface_weight=1.0, triplet_weight=0.5, triplet_margin=0.2):
+    def __init__(self, arcface_weight=1.0, triplet_weight=0.5, triplet_margin=0.2, label_smoothing: float = 0.0):
         super().__init__()
         self.arcface_weight = arcface_weight
         self.triplet_weight = triplet_weight
-        self.arcface_loss = ArcFaceLoss()
+        self.arcface_loss = ArcFaceLoss(label_smoothing=label_smoothing)
         self.triplet_loss = TripletLoss(margin=triplet_margin)
         
     def forward(self, logits, embeddings, labels):
@@ -136,7 +136,6 @@ class CombinedRecognitionLoss(nn.Module):
         arcface_loss = self.arcface_loss(logits, labels)
         triplet_loss = self.triplet_loss(embeddings, labels)
         
-        total_loss = (self.arcface_weight * arcface_loss + 
-                     self.triplet_weight * triplet_loss)
+        total_loss = (self.arcface_weight * arcface_loss + self.triplet_weight * triplet_loss)
         
         return total_loss, arcface_loss, triplet_loss
