@@ -110,6 +110,7 @@ def main():
     parser.add_argument('--recog_model', type=str, required=True, help='Recognition model path')
     parser.add_argument('--person_ids', type=str, help='Person IDs JSON file (optional)')
     parser.add_argument('--output_path', type=str, required=True, help='Database output path')
+    parser.add_argument('--templates_per_id', type=int, default=1, help='Number of templates per person-eye (use >1 to enable clustering)')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'], help='Device to use (auto/cpu/cuda)')
     
     args = parser.parse_args()
@@ -207,33 +208,57 @@ def main():
             print(f'Error processing {img_path}: {e}')
             continue
     
-    # 计算每个人的稳健平均嵌入（L2 归一化 + 以与中位数偏差>2σ为准的剔除）
-    print('Computing robust average embeddings...')
+    # 计算每个人的模板：稳健平均或多模板（K-means）
+    print('Computing templates per person-eye...')
+    K = max(1, int(args.templates_per_id))
     for person_id in list(database.keys()):
         embeddings = np.asarray(database[person_id], dtype=np.float32)  # (N, D)
         if embeddings.ndim != 2 or embeddings.shape[0] == 0:
+            database[person_id] = []
             continue
         # L2 normalize each embedding
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12
         emb_norm = embeddings / norms
-        # Median prototype (component-wise median), then normalize
+        # Outlier removal via median prototype
         med = np.median(emb_norm, axis=0)
         med_norm = med / (np.linalg.norm(med) + 1e-12)
-        # Cosine similarity to median
-        sims = emb_norm @ med_norm  # (N,)
+        sims = emb_norm @ med_norm
         med_s = float(np.median(sims))
         std_s = float(np.std(sims))
-        if std_s == 0.0:
-            inlier_mask = np.ones_like(sims, dtype=bool)
+        inlier_mask = np.ones_like(sims, dtype=bool) if std_s == 0.0 else (np.abs(sims - med_s) <= (2.0 * std_s))
+        X = emb_norm[inlier_mask]
+        if X.shape[0] == 0:
+            X = emb_norm
+        if K == 1 or X.shape[0] < 2:
+            # single robust mean
+            center = X.mean(axis=0)
+            center = center / (np.linalg.norm(center) + 1e-12)
+            database[person_id] = [center.astype(np.float32)]
         else:
-            # Keep samples with |sim - median| <= 2*std
-            inlier_mask = np.abs(sims - med_s) <= (2.0 * std_s)
-        inliers = emb_norm[inlier_mask]
-        if inliers.shape[0] == 0:
-            inliers = emb_norm  # fallback to all
-        avg = inliers.mean(axis=0)
-        avg = avg / (np.linalg.norm(avg) + 1e-12)
-        database[person_id] = avg.astype(np.float32)
+            # K-means clustering into K centers
+            try:
+                from sklearn.cluster import KMeans
+                k_eff = min(K, X.shape[0])
+                km = KMeans(n_clusters=k_eff, n_init=10, random_state=42)
+                labels = km.fit_predict(X)
+                centers = []
+                for c in range(k_eff):
+                    cluster = X[labels == c]
+                    if cluster.shape[0] == 0:
+                        continue
+                    ctr = cluster.mean(axis=0)
+                    ctr = ctr / (np.linalg.norm(ctr) + 1e-12)
+                    centers.append(ctr.astype(np.float32))
+                if not centers:
+                    ctr = X.mean(axis=0)
+                    ctr = ctr / (np.linalg.norm(ctr) + 1e-12)
+                    centers = [ctr.astype(np.float32)]
+                database[person_id] = centers
+            except Exception:
+                # fallback to single center
+                center = X.mean(axis=0)
+                center = center / (np.linalg.norm(center) + 1e-12)
+                database[person_id] = [center.astype(np.float32)]
     
     # 保存数据库
     print(f'Saving database to {args.output_path}...')

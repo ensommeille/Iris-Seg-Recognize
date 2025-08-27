@@ -65,10 +65,10 @@ python train_seg.py \
 python train_recog.py \
     --data_root data \
     --output_dir outputs/recognition \
-    --img_size 224 \
+    --img_size 256 \
     --batch_size 32 \
     --epochs 100 \
-    --lr 1e-3 \
+    --lr 5e-4 \
     --pretrained \
     --backbone mobilenet_v3 \
     --embedding_size 512 \
@@ -77,17 +77,47 @@ python train_recog.py \
     --use_mask
 ```
 
-### 3. 推理
+### 3. 构建数据库
 
+```bash
+python build_database.py \
+    --data_root data \
+    --seg_model outputs/segmentation/best_model.pth \
+    --recog_model outputs/recognition/best_model.pth \
+    --output_path database/database.pkl
+```
+
+### 4. 推理
+
+#### 单张图像查询
 ```bash
 python inference.py \
     --seg_model outputs/segmentation/best_model.pth \
     --recog_model outputs/recognition/best_model.pth \
-    --person_ids outputs/recognition/person_ids.json \
-    --database_path database.pkl \
+    --database_path database/database.pkl \
     --query_image test_image.jpg \
     --top_k 5 \
     --threshold 0.5
+```
+
+#### 批量评估
+```bash
+python inference.py \
+    --seg_model outputs/segmentation/best_model.pth \
+    --recog_model outputs/recognition/best_model.pth \
+    --database_path database/database.pkl \
+    --eval_dir test_images/ \
+    --results_csv results.csv \
+    --sample_n 100
+```
+
+### 5. 数据库分析
+
+```bash
+python analyze_database.py \
+    --database_path database/database.pkl \
+    --out_dir outputs/db_analysis \
+    --topk 20
 ```
 
 ## 模型架构
@@ -96,70 +126,129 @@ python inference.py \
 - **Backbone**: MobileNetV3 (或MobileNetV2作为备选)
 - **Decoder**: UNet-style decoder with ASPP
 - **Attention**: CBAM (Channel and Spatial Attention)
-- **Loss**: BCE + Dice + Focal Loss
+- **Loss**: BCEWithLogits + Dice + Boundary Loss
+- **特性**: 支持多数据集平衡训练、混合精度训练(AMP)、余弦学习率调度
 
 ### 识别模型
 - **Backbone**: MobileNetV3
 - **Embedding**: 512维特征向量
 - **Classification Head**: ArcFace
 - **Loss**: ArcFace Loss + Triplet Loss
+- **特性**: 支持掩码预处理、可恢复训练、Top-k准确率评估
 
 ## 训练策略
 
 ### 分割模型训练
-1. 独立训练分割模型
-2. 使用组合损失函数：BCE + Dice + Focal
-3. 保存最佳Dice分数的模型
+1. **基础训练**: 使用train_seg.py进行标准训练
+2. **改进训练**: 使用seg/main.py支持多数据集平衡训练
+3. **损失函数**: BCEWithLogits + Dice + Boundary Loss组合
+4. **优化策略**: 余弦学习率调度、混合精度训练(AMP)
+5. **评估指标**: Dice Score、IoU Score
+6. **模型保存**: 保存最佳Dice分数的模型
 
 ### 识别模型训练
-1. 使用预训练的分割模型生成掩码
-2. 对输入图像应用掩码进行预处理
-3. 使用ArcFace + Triplet Loss进行训练
-4. 保存最佳准确率的模型
+1. **数据预处理**: 可选使用预训练分割模型生成掩码
+2. **损失函数**: ArcFace Loss + Triplet Loss组合
+3. **优化器**: AdamW优化器，支持学习率调度
+4. **评估指标**: Top-1/Top-5准确率
+5. **模型保存**: 保存最佳准确率的模型
+6. **恢复训练**: 支持从检查点恢复训练
 
 ## 推理流程
 
-1. **分割阶段**: 使用分割模型生成虹膜掩码
-2. **预处理**: 应用掩码裁剪虹膜区域
-3. **特征提取**: 使用识别模型提取512维嵌入向量
-4. **相似度计算**: 与数据库中的嵌入向量计算余弦相似度
-5. **结果排序**: 返回最相似的人员ID
+### 单张图像查询
+1. **图像预处理**: 读取并调整图像尺寸到256x256
+2. **分割阶段**: 使用分割模型生成虹膜掩码
+3. **掩码应用**: 将掩码应用到原图像上
+4. **特征提取**: 使用识别模型提取512维嵌入向量
+5. **相似度计算**: 与数据库中的嵌入向量计算余弦相似度
+6. **结果排序**: 返回Top-K最相似的人员ID和相似度分数
+
+### 批量评估
+1. **目录扫描**: 扫描指定目录下的所有图像文件
+2. **文件名解析**: 从文件名提取人员ID和眼部信息(如S5999L00.jpg)
+3. **批量处理**: 对每张图像执行完整的推理流程
+4. **性能评估**: 计算Top-1/Top-5准确率和平均相似度
+5. **结果保存**: 将结果保存为CSV文件
 
 ## 数据库构建
 
-数据库包含每个注册用户的平均嵌入向量：
-- 遍历所有注册用户图像
-- 使用分割+识别模型提取嵌入
-- 计算每个用户的平均嵌入向量
-- 保存为pickle文件
+### 标准数据集模式
+- 遍历data_root下的images和masks目录
+- 使用分割+识别模型提取每张图像的嵌入向量
+- 按person_id_eye格式组织(如S5999_L)
+- 支持多模板存储或平均嵌入向量
+
+### 评估数据集模式
+- 仅需要images目录，无需masks
+- 使用分割模型自动生成掩码
+- 从文件名解析人员ID和眼部信息
+- 保存为pickle格式的字典文件
 
 ## 性能指标
 
 ### 分割模型
-- Dice Score
-- IoU Score
-- 分割精度
+- **Dice Score**: 分割重叠度评估
+- **IoU Score**: 交并比评估
+- **Boundary Loss**: 边界质量评估
+- **训练监控**: TensorBoard日志记录
 
 ### 识别模型
-- 分类准确率
-- ArcFace Loss
-- Triplet Loss
+- **Top-1/Top-5准确率**: 分类性能评估
+- **ArcFace Loss**: 角度边际损失
+- **Triplet Loss**: 三元组损失
+- **余弦相似度**: 特征向量相似度
 
-## 扩展性
+### 数据库质量分析
+- **嵌入向量统计**: L2范数分布
+- **冒充者分布**: 不同人员间相似度
+- **真实匹配分布**: 同人不同眼相似度
+- **混淆对分析**: 最易混淆的人员对
 
-该pipeline设计为模块化架构，便于后续改进：
-- 支持不同的backbone网络
-- 可调整损失函数权重
-- 易于集成新的数据增强策略
-- 支持联合训练模式
+## 功能特性
+
+### 分割模块特性
+- **多数据集训练**: 支持多个数据集平衡采样
+- **强化数据增强**: 使用albumentations库
+- **注意力机制**: CBAM通道和空间注意力
+- **混合精度训练**: 自动混合精度(AMP)加速
+- **ONNX支持**: 模型转换和推理优化
+
+### 识别模块特性
+- **掩码预处理**: 可选的分割掩码应用
+- **多损失函数**: ArcFace + Triplet组合损失
+- **恢复训练**: 支持从检查点继续训练
+- **批量评估**: 目录级别的性能评估
+- **数据库分析**: 嵌入质量分析工具
 
 ## 注意事项
 
-1. 确保数据格式正确，图像和掩码文件名对应
-2. 训练时建议使用GPU加速
-3. 可以根据数据量调整batch_size和学习率
-4. 推理时需要先构建数据库
-5. 相似度阈值可根据实际需求调整
+### 数据准备
+1. **标准训练**: 确保data_root下有images/和masks/目录，文件名对应
+2. **评估数据**: 仅需images目录，文件名格式如S5999L00.jpg
+3. **文件命名**: 前缀为人员ID，L/R表示左右眼，数字为序号
+
+### 训练配置
+1. **GPU推荐**: 训练时强烈建议使用GPU加速
+2. **内存要求**: 根据数据量调整batch_size，避免内存溢出
+3. **学习率**: 分割模型1e-3，识别模型5e-4为推荐起始值
+4. **混合精度**: 使用--amp参数可显著加速训练
+
+### 推理使用
+1. **数据库构建**: 推理前必须先构建数据库
+2. **阈值调整**: 相似度阈值可根据实际需求调整(推荐0.5)
+3. **批量处理**: 支持目录级别的批量评估
+4. **结果分析**: 使用analyze_database.py分析数据库质量
+
+### 模型格式
+1. **PyTorch模型**: .pth格式，包含完整训练状态
+2. **ONNX模型**: .onnx格式，用于优化推理性能
+3. **模型转换**: 训练完成后自动生成ONNX版本
+
+### 依赖环境
+1. **CUDA要求**: GPU推理需要CUDA 12.x和cuDNN 9.x
+2. **ONNX Runtime**: 根据设备选择CPU或GPU版本
+3. **虚拟环境**: 建议使用虚拟环境管理依赖
 
 ## 许可证
 

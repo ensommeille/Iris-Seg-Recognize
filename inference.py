@@ -16,6 +16,7 @@ import csv
 import time
 from tqdm import tqdm
 import random
+import cv2 as _cv2
 
 from models.segmentation import build_segmentation_model
 from models.recognition import build_recognition_model
@@ -54,6 +55,29 @@ class IrisInference:
         self.recog_model.to(self.device)
         self.recog_model.eval()
         self.database = {}
+
+    def save_segmentation(self, image_path, mask_bin, out_mask_path=None, out_overlay_path=None, alpha=0.5):
+        try:
+            img_bgr = _cv2.imread(image_path)
+            if img_bgr is None:
+                return
+            h, w = img_bgr.shape[:2]
+            mask_uint8 = (mask_bin * 255.0).astype('uint8') if mask_bin.max() <= 1.0 else mask_bin.astype('uint8')
+            mask_resized = _cv2.resize(mask_uint8, (w, h), interpolation=_cv2.INTER_NEAREST)
+            if out_mask_path:
+                _cv2.imwrite(out_mask_path, mask_resized)
+            if out_overlay_path:
+                overlay = img_bgr.copy()
+                # 创建绿色掩码
+                green_mask = np.zeros_like(img_bgr)
+                green_mask[:, :] = (0, 255, 0)  # BGR格式的绿色
+                # 在掩码区域应用绿色覆盖
+                mask_3ch = np.stack([mask_resized, mask_resized, mask_resized], axis=2) > 127
+                overlay[mask_3ch] = _cv2.addWeighted(img_bgr, 1 - alpha, green_mask, alpha, 0)[mask_3ch]
+                _cv2.imwrite(out_overlay_path, overlay)
+        except Exception as e:
+            print(f"Error in save_segmentation: {e}")
+            pass
     
     def preprocess_image(self, image_path, img_size=256):
         img = cv2.imread(image_path)
@@ -97,8 +121,13 @@ class IrisInference:
         embedding = self.extract_embedding(img_tensor, mask, img_size=256)
         
         similarities = []
-        for person_id, db_embedding in self.database.items():
-            similarity = cosine_similarity([embedding], [db_embedding])[0, 0]
+        for person_id, db_value in self.database.items():
+            # db_value can be a single vector or a list of template vectors
+            if isinstance(db_value, list):
+                sims = [cosine_similarity([embedding], [tpl])[0,0] for tpl in db_value]
+                similarity = float(max(sims)) if sims else -1.0
+            else:
+                similarity = float(cosine_similarity([embedding], [db_value])[0, 0])
             similarities.append((person_id, similarity))
         
         similarities.sort(key=lambda x: x[1], reverse=True)
@@ -113,7 +142,7 @@ class IrisInference:
         
         return results
 
-    def evaluate_directory(self, image_dir, top_k=5, threshold=0.5, results_csv=None, sample_n=100, seed=42):
+    def evaluate_directory(self, image_dir, top_k=5, threshold=0.5, results_csv=None, sample_n=100, seed=42, save_masks_dir=None):
         """Batch query over a directory and compute metrics.
         Assumes filenames like S5999L00.jpg, ground-truth combined id = S5999_L.
         """
@@ -162,18 +191,41 @@ class IrisInference:
                 eye = m.group(2).upper()
                 gt_id = f"{person_id}_{eye}"
 
-            results = self.query(image_path, top_k=top_k, threshold=threshold)
-            # results is list of dicts [{'person_id': id, 'similarity': sim, 'matched': bool}, ...]
+            # One forward path to get embedding; compute similarities once
+            img_tensor = self.preprocess_image(image_path, img_size=256)
+            mask = self.segment_iris(img_tensor)
+            if save_masks_dir:
+                os.makedirs(save_masks_dir, exist_ok=True)
+                base = os.path.splitext(os.path.basename(image_path))[0]
+                self.save_segmentation(
+                    image_path,
+                    mask,
+                    out_mask_path=os.path.join(save_masks_dir, f"{base}_mask.png"),
+                    out_overlay_path=os.path.join(save_masks_dir, f"{base}_overlay.jpg"),
+                    alpha=0.5,
+                )
+            embedding = self.extract_embedding(img_tensor, mask, img_size=256)
+
+            similarities = []
+            for pid_db, db_value in self.database.items():
+                if isinstance(db_value, list):
+                    sims = [cosine_similarity([embedding], [tpl])[0,0] for tpl in db_value]
+                    simv = float(max(sims)) if sims else -1.0
+                else:
+                    simv = float(cosine_similarity([embedding], [db_value])[0,0])
+                similarities.append((pid_db, simv))
+            similarities.sort(key=lambda x: x[1], reverse=True)
+            results = [{'person_id': p, 'similarity': s, 'matched': (s >= threshold)} for p, s in similarities[:top_k]]
             top1 = results[0] if results else {'person_id': None, 'similarity': 0.0}
 
-            # compute gt similarity directly if gt in database
+            # compute gt similarity from same embedding
             if gt_id is not None and gt_id in self.database:
-                # reuse embedding computed within query by recomputing once
-                # To avoid recomputing embedding twice, we redo minimal steps here
-                img_tensor = self.preprocess_image(image_path, img_size=256)
-                mask = self.segment_iris(img_tensor)
-                embedding = self.extract_embedding(img_tensor, mask, img_size=256)
-                gt_sim = float(cosine_similarity([embedding], [self.database[gt_id]])[0,0])
+                db_value = self.database[gt_id]
+                if isinstance(db_value, list):
+                    sims = [cosine_similarity([embedding], [tpl])[0,0] for tpl in db_value]
+                    gt_sim = float(max(sims)) if sims else float('nan')
+                else:
+                    gt_sim = float(cosine_similarity([embedding], [db_value])[0,0])
             else:
                 gt_sim = float('nan')
 
@@ -242,6 +294,7 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--top_k', type=int, default=5)
     parser.add_argument('--threshold', type=float, default=0.5)
+    parser.add_argument('--save_masks_dir', type=str, help='Directory to save predicted masks and overlays (optional)')
     
     args = parser.parse_args()
     
@@ -256,11 +309,24 @@ def main():
     
     # 查询
     if args.query_image:
+        # Also output mask visualization if requested
         results = inference.query(args.query_image, args.top_k, args.threshold)
         print('\nQuery Results:')
         for i, result in enumerate(results):
             status = '✓' if result['matched'] else '✗'
             print(f'{i+1}. {status} {result["person_id"]}: {result["similarity"]:.4f}')
+        if args.save_masks_dir:
+            os.makedirs(args.save_masks_dir, exist_ok=True)
+            img_tensor = inference.preprocess_image(args.query_image, img_size=256)
+            mask = inference.segment_iris(img_tensor)
+            base = os.path.splitext(os.path.basename(args.query_image))[0]
+            inference.save_segmentation(
+                args.query_image,
+                mask,
+                out_mask_path=os.path.join(args.save_masks_dir, f"{base}_mask.png"),
+                out_overlay_path=os.path.join(args.save_masks_dir, f"{base}_overlay.jpg"),
+                alpha=0.5,
+            )
     elif args.query_dir:
         _ = inference.evaluate_directory(
             args.query_dir,
@@ -269,6 +335,7 @@ def main():
             results_csv=args.results_csv,
             sample_n=args.sample_n,
             seed=args.seed,
+            save_masks_dir=args.save_masks_dir,
         )
     else:
         print('Please provide --query_image or --query_dir')
