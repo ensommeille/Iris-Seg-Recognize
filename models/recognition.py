@@ -104,6 +104,10 @@ class IrisRecognitionModel(nn.Module):
                     self.backbone = models.mobilenet_v2(pretrained=pretrained)
                 self.backbone.classifier = nn.Identity()
                 backbone_features = 1280
+        elif backbone == 'complex_irisnet':
+            # Lightweight complex-valued backbone
+            self.backbone = ComplexIrisNetWrapper(base_channels=32)
+            backbone_features = self.backbone.out_channels
         else:
             if 'MobileNet_V2_Weights' in globals() and MobileNet_V2_Weights is not None:
                 weights = MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
@@ -130,7 +134,10 @@ class IrisRecognitionModel(nn.Module):
         
     def forward(self, x, labels=None):
         # Extract features
-        features = self.backbone.features(x)
+        if self.backbone_name == 'complex_irisnet':
+            features = self.backbone.features(x)
+        else:
+            features = self.backbone.features(x)
         
         # Get embeddings
         embeddings = self.embedding_head(features)
@@ -155,3 +162,110 @@ def build_recognition_model(num_classes, embedding_size=512, pretrained=True, ba
         pretrained=pretrained,
         backbone=backbone
     )
+
+
+# ------------------------------
+# Complex-valued primitives
+# ------------------------------
+class ComplexConv2d(nn.Module):
+    """Complex 2D convolution implemented with two real convolutions.
+    Input/Output channel convention: [real, imag] concatenated along C.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True):
+        super().__init__()
+        # Real and Imag convs
+        self.conv_re = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
+        self.conv_im = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
+
+    def forward(self, x):
+        c = x.shape[1] // 2
+        xr, xi = x[:, :c], x[:, c:]
+        yr = self.conv_re(xr) - self.conv_im(xi)
+        yi = self.conv_re(xi) + self.conv_im(xr)
+        return torch.cat([yr, yi], dim=1)
+
+
+class ComplexBatchNorm2d(nn.Module):
+    """Apply BN to real and imag parts separately."""
+    def __init__(self, num_features):
+        super().__init__()
+        self.bn_r = nn.BatchNorm2d(num_features)
+        self.bn_i = nn.BatchNorm2d(num_features)
+
+    def forward(self, x):
+        c = x.shape[1] // 2
+        xr, xi = x[:, :c], x[:, c:]
+        xr = self.bn_r(xr)
+        xi = self.bn_i(xi)
+        return torch.cat([xr, xi], dim=1)
+
+
+class ComplexReLU(nn.Module):
+    """ReLU applied to real and imag parts independently."""
+    def __init__(self, inplace=True):
+        super().__init__()
+        self.relu = nn.ReLU(inplace=inplace)
+
+    def forward(self, x):
+        c = x.shape[1] // 2
+        xr, xi = x[:, :c], x[:, c:]
+        xr = self.relu(xr)
+        xi = self.relu(xi)
+        return torch.cat([xr, xi], dim=1)
+
+
+class ComplexConvBNReLU(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
+        super().__init__()
+        self.block = nn.Sequential(
+            ComplexConv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False),
+            ComplexBatchNorm2d(out_ch),
+            ComplexReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ComplexIrisNetBackbone(nn.Module):
+    """A lightweight complex-valued CNN backbone with downsampling stages.
+    Input is real RGB (B,3,H,W). We convert it to complex by concatenating a zero imaginary part.
+    The network returns complex features as concatenated real/imag channels (2*C).
+    """
+    def __init__(self, base_channels=32):
+        super().__init__()
+        # After converting to complex, input channels become 2*3=6, but our ComplexConv2d expects in_ch as real channels count.
+        # We keep a helper that expands input to complex at runtime; first layer therefore uses in_ch=3 and internally handles split.
+        # To keep shapes consistent, we manually build complex tensors before feeding blocks.
+        self.c1 = ComplexConvBNReLU(3, base_channels, k=3, s=2, p=1)      # -> 2*base
+        self.c2 = ComplexConvBNReLU(base_channels, base_channels*2, k=3, s=2, p=1)  # -> 4*base
+        self.c3 = ComplexConvBNReLU(base_channels*2, base_channels*4, k=3, s=2, p=1) # -> 8*base
+        self.c4 = ComplexConvBNReLU(base_channels*4, base_channels*8, k=3, s=1, p=1) # -> 16*base
+        self.out_complex_channels = base_channels * 8  # real channels count (imag the same)
+
+    def _to_complex(self, x):
+        # x: (B, C, H, W) real-valued -> concat imag zeros
+        zeros = torch.zeros_like(x)
+        return torch.cat([x, zeros], dim=1)
+
+    def forward(self, x):
+        # Represent as complex (concat real/imag)
+        x = self._to_complex(x)
+        x = self.c1(x)
+        x = self.c2(x)
+        x = self.c3(x)
+        x = self.c4(x)
+        # Return as concatenated real/imag: channels = 2*out_complex_channels
+        return x
+
+
+class ComplexIrisNetWrapper(nn.Module):
+    """Wrapper to expose a .features module so it matches MobileNet interface."""
+    def __init__(self, base_channels=32):
+        super().__init__()
+        self.features = ComplexIrisNetBackbone(base_channels=base_channels)
+        # Expose out channels (real+imag concatenated)
+        self.out_channels = self.features.out_complex_channels * 2
+
+    def forward(self, x):
+        return self.features(x)

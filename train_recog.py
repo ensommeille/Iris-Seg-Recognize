@@ -31,7 +31,7 @@ def topk_accuracy(outputs, labels, ks=(1,5)):
     return res
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, device, classification_enabled=True):
     """训练一个epoch"""
     model.train()
     total_loss = 0
@@ -46,15 +46,22 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         labels = labels.to(device)
         
         optimizer.zero_grad()
-        logits, embeddings = model(images, labels)
+        if classification_enabled:
+            logits, embeddings = model(images, labels)
+        else:
+            embeddings = model(images, labels=None)
+            logits = None
         loss, arcface_loss, triplet_loss = criterion(logits, embeddings, labels)
         loss.backward()
         optimizer.step()
         
-        # 计算准确率
-        accs = topk_accuracy(logits, labels, ks=(1,5))
-        acc1 = accs.get(1, 0.0)
-        acc5 = accs.get(5, 0.0)
+        # 计算准确率（仅当启用分类时）
+        if classification_enabled and (logits is not None):
+            accs = topk_accuracy(logits, labels, ks=(1,5))
+            acc1 = accs.get(1, 0.0)
+            acc5 = accs.get(5, 0.0)
+        else:
+            acc1, acc5 = 0.0, 0.0
         
         total_loss += loss.item()
         total_arcface_loss += arcface_loss.item()
@@ -66,17 +73,18 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
             'Loss': f'{loss.item():.4f}',
             'ArcFace': f'{arcface_loss.item():.4f}',
             'Triplet': f'{triplet_loss.item():.4f}',
-            'Top1': f'{acc1:.6f}',
-            'Top5': f'{acc5:.6f}'
+            'Top1': f'{acc1:.6f}' if classification_enabled else '-',
+            'Top5': f'{acc5:.6f}' if classification_enabled else '-',
         })
     
     return (total_loss / len(dataloader), 
             total_arcface_loss / len(dataloader),
             total_triplet_loss / len(dataloader),
-            total_top1 / len(dataloader), total_top5 / len(dataloader))
+            (total_top1 / len(dataloader)) if classification_enabled else 0.0,
+            (total_top5 / len(dataloader)) if classification_enabled else 0.0)
 
 
-def validate_epoch(model, dataloader, criterion, device):
+def validate_epoch(model, dataloader, criterion, device, classification_enabled=True):
     """验证一个epoch"""
     model.eval()
     total_loss = 0
@@ -91,13 +99,20 @@ def validate_epoch(model, dataloader, criterion, device):
             images = images.to(device)
             labels = labels.to(device)
             
-            logits, embeddings = model(images, labels)
+            if classification_enabled:
+                logits, embeddings = model(images, labels)
+            else:
+                embeddings = model(images, labels=None)
+                logits = None
             loss, arcface_loss, triplet_loss = criterion(logits, embeddings, labels)
             
-            # 计算准确率
-            accs = topk_accuracy(logits, labels, ks=(1,5))
-            acc1 = accs.get(1, 0.0)
-            acc5 = accs.get(5, 0.0)
+            # 计算准确率（仅当启用分类时）
+            if classification_enabled and (logits is not None):
+                accs = topk_accuracy(logits, labels, ks=(1,5))
+                acc1 = accs.get(1, 0.0)
+                acc5 = accs.get(5, 0.0)
+            else:
+                acc1, acc5 = 0.0, 0.0
             
             total_loss += loss.item()
             total_arcface_loss += arcface_loss.item()
@@ -109,14 +124,15 @@ def validate_epoch(model, dataloader, criterion, device):
                 'Loss': f'{loss.item():.4f}',
                 'ArcFace': f'{arcface_loss.item():.4f}',
                 'Triplet': f'{triplet_loss.item():.4f}',
-                'Top1': f'{acc1:.6f}',
-                'Top5': f'{acc5:.6f}'
+                'Top1': f'{acc1:.6f}' if classification_enabled else '-',
+                'Top5': f'{acc5:.6f}' if classification_enabled else '-',
             })
     
     return (total_loss / len(dataloader), 
             total_arcface_loss / len(dataloader),
             total_triplet_loss / len(dataloader),
-            total_top1 / len(dataloader), total_top5 / len(dataloader))
+            (total_top1 / len(dataloader)) if classification_enabled else 0.0,
+            (total_top5 / len(dataloader)) if classification_enabled else 0.0)
 
 
 def save_checkpoint(model, optimizer, epoch, best_metric, save_path):
@@ -149,6 +165,11 @@ def main():
     parser.add_argument('--triplet_weight', type=float, default=0.5, help='Triplet loss weight')
     parser.add_argument('--triplet_margin', type=float, default=0.2, help='Triplet loss margin')
     parser.add_argument('--use_mask', action='store_true', help='Use segmentation mask')
+    # 数据集划分与归一化相关
+    parser.add_argument('--split_mode', type=str, default='eye', choices=['eye', 'random'], help='Dataset split mode: eye (L 80/20, R test) or random')
+    parser.add_argument('--normalize_iris', action='store_true', default=True, help='Normalize iris to pseudo-polar 64x256 before training')
+    parser.add_argument('--norm_H', type=int, default=64, help='Iris normalization height (radial samples)')
+    parser.add_argument('--norm_W', type=int, default=256, help='Iris normalization width (angular samples)')
     parser.add_argument('--resume', type=str, default='', help='Path to checkpoint to resume training (model+optimizer+epoch)')
     parser.add_argument('--init_model', type=str, default='', help='Init model weights from checkpoint (model only, epoch=0)')
     
@@ -167,12 +188,27 @@ def main():
     
     # 构建数据集
     print('Building datasets...')
-    train_dataset, val_dataset = build_recognition_datasets(
-        args.data_root, 
-        img_size=args.img_size, 
-        val_split=args.val_split,
-        use_mask=args.use_mask
-    )
+    if args.split_mode == 'eye':
+        from utils.dataset import build_recognition_datasets_eye_split
+        train_dataset, val_dataset, test_dataset = build_recognition_datasets_eye_split(
+            args.data_root,
+            seed=42,
+            use_mask=args.use_mask,
+            normalize=args.normalize_iris,
+            norm_H=args.norm_H,
+            norm_W=args.norm_W,
+        )
+        print(f'Test samples (Right eye): {len(test_dataset)}')
+    else:
+        train_dataset, val_dataset = build_recognition_datasets(
+            args.data_root, 
+            img_size=args.img_size, 
+            val_split=args.val_split,
+            use_mask=args.use_mask,
+            normalize=args.normalize_iris,
+            norm_H=args.norm_H,
+            norm_W=args.norm_W,
+        )
     
     train_loader = DataLoader(
         train_dataset, 
@@ -203,6 +239,21 @@ def main():
         backbone=args.backbone
     )
     model = model.to(device)
+
+    # 根据配置决定是否启用分类分支（ArcFace）
+    classification_enabled = (args.arcface_weight > 0.0)
+    if not classification_enabled:
+        print('Classification branch disabled: training with Triplet loss only.')
+
+    # 损失函数和优化器
+    criterion = CombinedRecognitionLoss(
+        arcface_weight=args.arcface_weight if classification_enabled else 0.0,
+        triplet_weight=args.triplet_weight,
+        triplet_margin=args.triplet_margin,
+        label_smoothing=0.1
+    )
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
     
     # Extended ArcFace warmup schedule
     # 0–5: margin=0.0, scale=16; 6–10: margin=0.2, scale=20; >=11: margin=0.4, scale=28
@@ -213,16 +264,6 @@ def main():
             model.arcface_head.set_params(scale=20.0, margin=0.2)
         else:
             model.arcface_head.set_params(scale=28.0, margin=0.4)
-    
-    # 损失函数和优化器（ArcFace 启用 label smoothing）
-    criterion = CombinedRecognitionLoss(
-        arcface_weight=args.arcface_weight,
-        triplet_weight=args.triplet_weight,
-        triplet_margin=args.triplet_margin,
-        label_smoothing=0.1
-    )
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
     
     # TensorBoard
     writer = SummaryWriter(os.path.join(args.output_dir, 'logs'))
@@ -271,16 +312,17 @@ def main():
         
         # 训练
         train_loss, train_arcface, train_triplet, train_top1, train_top5 = train_epoch(
-            model, train_loader, criterion, optimizer, device
+            model, train_loader, criterion, optimizer, device, classification_enabled=classification_enabled
         )
         
         # 验证
         val_loss, val_arcface, val_triplet, val_top1, val_top5 = validate_epoch(
-            model, val_loader, criterion, device
+            model, val_loader, criterion, device, classification_enabled=classification_enabled
         )
         
-        # 学习率调度
-        scheduler.step(val_top1)
+        # 学习率调度（Triplet-only 时使用 val_triplet 近似替代）
+        scheduler_metric = val_top1 if classification_enabled else (-val_triplet)
+        scheduler.step(scheduler_metric)
         
         # 记录到TensorBoard
         writer.add_scalar('Loss/Train', train_loss, epoch)
@@ -289,24 +331,32 @@ def main():
         writer.add_scalar('ArcFace/Val', val_arcface, epoch)
         writer.add_scalar('Triplet/Train', train_triplet, epoch)
         writer.add_scalar('Triplet/Val', val_triplet, epoch)
-        writer.add_scalar('AccuracyTop1/Train', train_top1, epoch)
-        writer.add_scalar('AccuracyTop1/Val', val_top1, epoch)
-        writer.add_scalar('AccuracyTop5/Train', train_top5, epoch)
-        writer.add_scalar('AccuracyTop5/Val', val_top5, epoch)
+        if classification_enabled:
+            writer.add_scalar('AccuracyTop1/Train', train_top1, epoch)
+            writer.add_scalar('AccuracyTop1/Val', val_top1, epoch)
+            writer.add_scalar('AccuracyTop5/Train', train_top5, epoch)
+            writer.add_scalar('AccuracyTop5/Val', val_top5, epoch)
         writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
         
-        print(f'Train - Loss: {train_loss:.4f}, ArcFace: {train_arcface:.4f}, Triplet: {train_triplet:.4f}, Top1: {train_top1:.6f}, Top5: {train_top5:.6f}')
-        print(f'Val   - Loss: {val_loss:.4f}, ArcFace: {val_arcface:.4f}, Triplet: {val_triplet:.4f}, Top1: {val_top1:.6f}, Top5: {val_top5:.6f}')
+        print(f'Train - Loss: {train_loss:.4f}, ArcFace: {train_arcface:.4f}, Triplet: {train_triplet:.4f}, Top1: {(train_top1 if classification_enabled else 0.0):.6f}, Top5: {(train_top5 if classification_enabled else 0.0):.6f}')
+        print(f'Val   - Loss: {val_loss:.4f}, ArcFace: {val_arcface:.4f}, Triplet: {val_triplet:.4f}, Top1: {(val_top1 if classification_enabled else 0.0):.6f}, Top5: {(val_top5 if classification_enabled else 0.0):.6f}')
         
-        # 保存最佳模型
-        if val_top1 > best_acc:
-            best_acc = val_top1
+        # 保存最佳模型（Triplet-only 模式用最低验证Triplet损失作为指标）
+        if classification_enabled:
+            is_better = val_top1 > best_acc
+            metric_to_save = val_top1
+        else:
+            # Lower triplet loss is better
+            is_better = (epoch == start_epoch) or (val_triplet < best_acc) or (best_acc == 0.0)
+            metric_to_save = -val_triplet
+        if is_better:
+            best_acc = metric_to_save
             save_checkpoint(
                 model, optimizer, epoch, best_acc,
                 os.path.join(args.output_dir, 'best_model.pth')
             )
-            print(f'New best model saved with Acc: {best_acc:.4f}')
-        
+            print('New best model saved.')
+
         # 定期保存检查点
         if (epoch + 1) % 10 == 0:
             save_checkpoint(

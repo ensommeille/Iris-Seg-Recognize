@@ -77,15 +77,45 @@ python train_recog.py \
     --use_mask
 ```
 
+### 3. 训练识别模型
+
+【推荐】使用复值网络（complex_irisnet）+ ArcFace + Triplet，并启用虹膜橡皮片归一化与按眼划分：
+
+```bash
+python train_recog.py \
+  --data_root data \
+  --output_dir outputs/recognition_complex_arcface \
+  --backbone complex_irisnet \
+  --embedding_size 512 \
+  --batch_size 32 \
+  --epochs 100 \
+  --lr 3e-4 \
+  --weight_decay 1e-4 \
+  --triplet_weight 0.5 \
+  --triplet_margin 0.3 \
+  --arcface_weight 1.0 \
+  --use_mask \
+  --split_mode eye \
+  --normalize_iris \
+  --norm_H 64 \
+  --norm_W 256
+```
+
+- 如遇显存不足，可将 `--batch_size` 降为 16 或 8。
+- `--arcface_weight > 0` 时会启用分类分支（ArcFace）；否则仅使用 Triplet。
+
 ### 3. 构建数据库
 
 ```bash
 python build_database.py \
     --data_root data \
     --seg_model outputs/segmentation/best_model.pth \
-    --recog_model outputs/recognition/best_model.pth \
+    --recog_model outputs/recognition_complex_arcface/best_model.pth \
     --output_path database/database.pkl
 ```
+
+- 默认启用虹膜橡皮片归一化（`--normalize_iris`，尺寸 `64x256`），与训练保持一致；可通过 `--norm_H/--norm_W` 调整。
+- 也支持评估目录模式：使用 `--images_dir` 仅给定图像目录（无需 masks）。
 
 ### 4. 推理
 
@@ -93,7 +123,7 @@ python build_database.py \
 ```bash
 python inference.py \
     --seg_model outputs/segmentation/best_model.pth \
-    --recog_model outputs/recognition/best_model.pth \
+    --recog_model outputs/recognition_complex_arcface/best_model.pth \
     --database_path database/database.pkl \
     --query_image test_image.jpg \
     --top_k 5 \
@@ -104,12 +134,14 @@ python inference.py \
 ```bash
 python inference.py \
     --seg_model outputs/segmentation/best_model.pth \
-    --recog_model outputs/recognition/best_model.pth \
+    --recog_model outputs/recognition_complex_arcface/best_model.pth \
     --database_path database/database.pkl \
     --eval_dir test_images/ \
     --results_csv results.csv \
     --sample_n 100
 ```
+
+- 推理默认执行虹膜橡皮片归一化（`--normalize_iris`，64x256）；若关闭归一化，则会对原图像应用分割掩码后再提取特征。
 
 ### 5. 数据库分析
 
@@ -117,8 +149,15 @@ python inference.py \
 python analyze_database.py \
     --database_path database/database.pkl \
     --out_dir outputs/db_analysis \
-    --topk 20
+    --topk 20 \
+    --num_thresholds 400
 ```
+
+- 输出包含：
+  - FAR/FRR 随阈值变化的 CSV（含等错误率 EER）
+  - ROC 曲线与 DET 曲线（PNG）
+  - L2 范数与余弦相似度直方图、Top-K 最混淆对
+- 说明：若要绘制 DET 曲线，建议安装 `scipy`（可选依赖）。
 
 ## 模型架构
 
@@ -130,11 +169,11 @@ python analyze_database.py \
 - **特性**: 支持多数据集平衡训练、混合精度训练(AMP)、余弦学习率调度
 
 ### 识别模型
-- **Backbone**: MobileNetV3
-- **Embedding**: 512维特征向量
-- **Classification Head**: ArcFace
-- **Loss**: ArcFace Loss + Triplet Loss
-- **特性**: 支持掩码预处理、可恢复训练、Top-k准确率评估
+- **Backbone**: MobileNetV3 或 ComplexIrisNet（复值轻量骨干）
+- **Embedding**: 512维特征向量（归一化用于余弦度量）
+- **Classification Head**: ArcFace（与 Triplet 可组合）
+- **Loss**: ArcFace Loss + Triplet Loss（`arcface_weight` 控制是否启用分类分支）
+- **特性**: 支持虹膜橡皮片归一化（64x256）、按眼划分数据集（L: train/val，R: test）
 
 ## 训练策略
 
@@ -147,19 +186,19 @@ python analyze_database.py \
 6. **模型保存**: 保存最佳Dice分数的模型
 
 ### 识别模型训练
-1. **数据预处理**: 可选使用预训练分割模型生成掩码
-2. **损失函数**: ArcFace Loss + Triplet Loss组合
-3. **优化器**: AdamW优化器，支持学习率调度
-4. **评估指标**: Top-1/Top-5准确率
-5. **模型保存**: 保存最佳准确率的模型
-6. **恢复训练**: 支持从检查点恢复训练
+1. **数据预处理**: 默认启用虹膜橡皮片归一化（64x256）；若关闭则可选择使用掩码相乘
+2. **数据划分**: 支持 `--split_mode eye`（左眼80/20为train/val；右眼为test）或随机划分
+3. **损失函数**: ArcFace Loss + Triplet Loss组合（ArcFace 由 `arcface_weight` 控制）
+4. **优化器**: AdamW优化器，支持学习率调度
+5. **评估指标**: Top-1/Top-5（仅在启用分类分支时计算）
+6. **模型保存**: 保存最佳验证指标的模型，支持从检查点恢复
 
 ## 推理流程
 
 ### 单张图像查询
-1. **图像预处理**: 读取并调整图像尺寸到256x256
+1. **图像预处理**: 读取图像
 2. **分割阶段**: 使用分割模型生成虹膜掩码
-3. **掩码应用**: 将掩码应用到原图像上
+3. **归一化**: 执行虹膜橡皮片归一化到 64x256（默认启用）；若关闭则对原图像乘以掩码
 4. **特征提取**: 使用识别模型提取512维嵌入向量
 5. **相似度计算**: 与数据库中的嵌入向量计算余弦相似度
 6. **结果排序**: 返回Top-K最相似的人员ID和相似度分数
@@ -167,7 +206,7 @@ python analyze_database.py \
 ### 批量评估
 1. **目录扫描**: 扫描指定目录下的所有图像文件
 2. **文件名解析**: 从文件名提取人员ID和眼部信息(如S5999L00.jpg)
-3. **批量处理**: 对每张图像执行完整的推理流程
+3. **批量处理**: 对每张图像执行完整的推理流程（含归一化）
 4. **性能评估**: 计算Top-1/Top-5准确率和平均相似度
 5. **结果保存**: 将结果保存为CSV文件
 
@@ -181,7 +220,7 @@ python analyze_database.py \
 
 ### 评估数据集模式
 - 仅需要images目录，无需masks
-- 使用分割模型自动生成掩码
+- 使用分割模型自动生成掩码并执行归一化
 - 从文件名解析人员ID和眼部信息
 - 保存为pickle格式的字典文件
 
@@ -201,25 +240,10 @@ python analyze_database.py \
 
 ### 数据库质量分析
 - **嵌入向量统计**: L2范数分布
-- **冒充者分布**: 不同人员间相似度
-- **真实匹配分布**: 同人不同眼相似度
+- **冒充者/真实分布**: 余弦相似度直方图
+- **FAR/FRR 与 EER**: 阈值扫描得到的错误率指标（导出CSV与图像）
+- **ROC/DET 曲线**: 识别性能曲线（DET 需 `scipy` 支持）
 - **混淆对分析**: 最易混淆的人员对
-
-## 功能特性
-
-### 分割模块特性
-- **多数据集训练**: 支持多个数据集平衡采样
-- **强化数据增强**: 使用albumentations库
-- **注意力机制**: CBAM通道和空间注意力
-- **混合精度训练**: 自动混合精度(AMP)加速
-- **ONNX支持**: 模型转换和推理优化
-
-### 识别模块特性
-- **掩码预处理**: 可选的分割掩码应用
-- **多损失函数**: ArcFace + Triplet组合损失
-- **恢复训练**: 支持从检查点继续训练
-- **批量评估**: 目录级别的性能评估
-- **数据库分析**: 嵌入质量分析工具
 
 ## 注意事项
 
@@ -231,7 +255,7 @@ python analyze_database.py \
 ### 训练配置
 1. **GPU推荐**: 训练时强烈建议使用GPU加速
 2. **内存要求**: 根据数据量调整batch_size，避免内存溢出
-3. **学习率**: 分割模型1e-3，识别模型5e-4为推荐起始值
+3. **学习率**: 分割模型1e-3，识别模型5e-4或3e-4为推荐起始值
 4. **混合精度**: 使用--amp参数可显著加速训练
 
 ### 推理使用
@@ -248,8 +272,4 @@ python analyze_database.py \
 ### 依赖环境
 1. **CUDA要求**: GPU推理需要CUDA 12.x和cuDNN 9.x
 2. **ONNX Runtime**: 根据设备选择CPU或GPU版本
-3. **虚拟环境**: 建议使用虚拟环境管理依赖
-
-## 许可证
-
-MIT License
+3. **可选**: `scipy`（用于DET曲线坐标变换）

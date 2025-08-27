@@ -14,11 +14,11 @@ from glob import glob
 
 from models.segmentation import build_segmentation_model
 from models.recognition import build_recognition_model
-from utils.dataset import collect_pairs, parse_filename
+from utils.dataset import collect_pairs, parse_filename, normalize_iris
 
 
 def preprocess_image(image_path, img_size=256):
-    """预处理图像"""
+    """预处理图像，返回用于分割的张量以及同尺寸的RGB图像"""
     img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise RuntimeError(f'Cannot read image: {image_path}')
@@ -39,7 +39,8 @@ def preprocess_image(image_path, img_size=256):
     # 转换为tensor
     img_tensor = torch.from_numpy(img_normalized.transpose(2, 0, 1)).unsqueeze(0)
     
-    return img_tensor
+    # 返回分割所用tensor与与其对应的RGB图像（H,W,3，0-255）
+    return img_tensor, img_resized
 
 
 def segment_iris(model, image_tensor, device):
@@ -112,6 +113,10 @@ def main():
     parser.add_argument('--output_path', type=str, required=True, help='Database output path')
     parser.add_argument('--templates_per_id', type=int, default=1, help='Number of templates per person-eye (use >1 to enable clustering)')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'], help='Device to use (auto/cpu/cuda)')
+    # 归一化相关
+    parser.add_argument('--normalize_iris', action='store_true', default=True, help='Normalize iris using pseudo-polar (rubber-sheet) mapping before embedding')
+    parser.add_argument('--norm_H', type=int, default=64, help='Iris normalization height (radial samples)')
+    parser.add_argument('--norm_W', type=int, default=256, help='Iris normalization width (angular samples)')
     
     args = parser.parse_args()
     
@@ -190,13 +195,24 @@ def main():
         
         try:
             # 预处理图像
-            img_tensor = preprocess_image(img_path, img_size=256)
+            img_tensor, img_resized_rgb = preprocess_image(img_path, img_size=256)
             
             # 分割虹膜（若 eval-only 没有掩码，也统一用分割模型预测）
             mask = segment_iris(seg_model, img_tensor, device)
             
-            # 提取嵌入（一致使用 256 尺寸）
-            embedding = extract_embedding(recog_model, img_tensor, mask, img_size=256, device=device)
+            # 根据配置决定是否做虹膜归一化
+            if args.normalize_iris:
+                # 归一化需要二值mask (0/1)
+                bin_mask = (mask > 0.5).astype('uint8')
+                norm_img = normalize_iris(img_resized_rgb, bin_mask, H=args.norm_H, W=args.norm_W)
+                if norm_img.ndim == 2:
+                    norm_img = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2RGB)
+                norm_tensor = torch.from_numpy((norm_img.astype(np.float32) / 255.0).transpose(2, 0, 1)).unsqueeze(0)
+                # 直接提取嵌入（不再乘掩码），并保持宽度作为基准避免被强制拉伸
+                embedding = extract_embedding(recog_model, norm_tensor, mask=None, img_size=args.norm_W, device=device)
+            else:
+                # 提取嵌入（一致使用 256 尺寸），并按掩码相乘
+                embedding = extract_embedding(recog_model, img_tensor, mask, img_size=256, device=device)
             
             # 存储到数据库（根据人员-眼睛区分）
             combined_id = f"{person_id}_{eye_type}"

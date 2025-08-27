@@ -129,12 +129,27 @@ class CombinedRecognitionLoss(nn.Module):
     def forward(self, logits, embeddings, labels):
         """
         Args:
-            logits: ArcFace logits
-            embeddings: normalized embeddings
+            logits: ArcFace logits，若为None则不计算ArcFace
+            embeddings: normalized embeddings，若为None则不计算Triplet
             labels: ground truth labels
         """
-        arcface_loss = self.arcface_loss(logits, labels)
-        triplet_loss = self.triplet_loss(embeddings, labels)
+        device = None
+        if isinstance(embeddings, torch.Tensor):
+            device = embeddings.device
+        elif isinstance(logits, torch.Tensor):
+            device = logits.device
+        
+        # ArcFace
+        if (logits is not None) and (self.arcface_weight > 0):
+            arcface_loss = self.arcface_loss(logits, labels)
+        else:
+            arcface_loss = torch.tensor(0.0, device=device if device is not None else None)
+        
+        # Triplet
+        if (embeddings is not None) and (self.triplet_weight > 0):
+            triplet_loss = self.triplet_loss(embeddings, labels)
+        else:
+            triplet_loss = torch.tensor(0.0, device=device if device is not None else None)
         
         total_loss = (self.arcface_weight * arcface_loss + self.triplet_weight * triplet_loss)
         

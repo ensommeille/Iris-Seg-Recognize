@@ -20,10 +20,14 @@ import cv2 as _cv2
 
 from models.segmentation import build_segmentation_model
 from models.recognition import build_recognition_model
+from utils.dataset import normalize_iris
 
 
 class IrisInference:
-    def __init__(self, seg_model_path, recog_model_path, device='auto'):
+    def __init__(self, seg_model_path, recog_model_path, device='auto', normalize=True, norm_H=64, norm_W=256):
+        self.normalize = normalize
+        self.norm_H = norm_H
+        self.norm_W = norm_W
         if device == 'auto':
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
@@ -55,6 +59,9 @@ class IrisInference:
         self.recog_model.to(self.device)
         self.recog_model.eval()
         self.database = {}
+        
+        # 最近一次分割的掩码（原图分辨率），用于可视化
+        self._last_mask_orig = None
 
     def save_segmentation(self, image_path, mask_bin, out_mask_path=None, out_overlay_path=None, alpha=0.5):
         try:
@@ -83,13 +90,28 @@ class IrisInference:
         img = cv2.imread(image_path)
         if img is None:
             raise RuntimeError(f'Cannot read image: {image_path}')
-        
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img_resized = cv2.resize(img, (img_size, img_size))
-        img_normalized = img_resized.astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(img_normalized.transpose(2, 0, 1)).unsqueeze(0)
-        
-        return img_tensor
+        if self.normalize:
+            # 在缩放图上执行分割得到mask，再将mask放缩回原图尺寸后做归一化展开
+            img_for_seg = cv2.resize(img, (img_size, img_size))
+            img_norm = img_for_seg.astype(np.float32) / 255.0
+            img_tensor = torch.from_numpy(img_norm.transpose(2, 0, 1)).unsqueeze(0)
+            mask_small = self.segment_iris(img_tensor)
+            # 将mask映射回原图尺寸，并缓存用于可视化
+            mask_orig = (cv2.resize((mask_small * 255).astype('uint8'), (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST) > 127).astype('uint8')
+            self._last_mask_orig = mask_orig
+            # 归一化为伪极坐标图
+            norm_img = normalize_iris(img, mask_orig, H=self.norm_H, W=self.norm_W)
+            if norm_img.ndim == 2:
+                norm_img = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2RGB)
+            img_normalized = norm_img.astype(np.float32) / 255.0
+            img_tensor = torch.from_numpy(img_normalized.transpose(2, 0, 1)).unsqueeze(0)
+            return img_tensor
+        else:
+            img_resized = cv2.resize(img, (img_size, img_size))
+            img_normalized = img_resized.astype(np.float32) / 255.0
+            img_tensor = torch.from_numpy(img_normalized.transpose(2, 0, 1)).unsqueeze(0)
+            return img_tensor
     
     def segment_iris(self, image_tensor):
         with torch.no_grad():
@@ -101,7 +123,8 @@ class IrisInference:
         return mask.cpu().numpy()[0, 0]
     
     def extract_embedding(self, image_tensor, mask=None, img_size=256):
-        if mask is not None:
+        # 当preprocess_image已执行归一化时，直接送入模型
+        if not self.normalize and (mask is not None):
             mask_resized = cv2.resize(mask, (img_size, img_size))
             mask_tensor = torch.from_numpy(mask_resized).unsqueeze(0).unsqueeze(0)
             image_tensor = image_tensor * mask_tensor
@@ -115,10 +138,33 @@ class IrisInference:
         
         return embedding.cpu().numpy()[0]
     
-    def query(self, image_path, top_k=5, threshold=0.5):
+    def query(self, image_path, top_k=5, threshold=0.5, save_masks_dir=None):
         img_tensor = self.preprocess_image(image_path, img_size=256)
-        mask = self.segment_iris(img_tensor)
-        embedding = self.extract_embedding(img_tensor, mask, img_size=256)
+        mask = None
+        if not self.normalize:
+            mask = self.segment_iris(img_tensor)
+        embedding = self.extract_embedding(img_tensor, mask, img_size=(self.norm_W if self.normalize else 256))
+        
+        # 可选地保存掩码与叠加图
+        if save_masks_dir:
+            os.makedirs(save_masks_dir, exist_ok=True)
+            base = os.path.splitext(os.path.basename(image_path))[0]
+            if self.normalize and self._last_mask_orig is not None:
+                self.save_segmentation(
+                    image_path,
+                    self._last_mask_orig,
+                    out_mask_path=os.path.join(save_masks_dir, f"{base}_mask.png"),
+                    out_overlay_path=os.path.join(save_masks_dir, f"{base}_overlay.jpg"),
+                    alpha=0.5,
+                )
+            elif mask is not None:
+                self.save_segmentation(
+                    image_path,
+                    mask,
+                    out_mask_path=os.path.join(save_masks_dir, f"{base}_mask.png"),
+                    out_overlay_path=os.path.join(save_masks_dir, f"{base}_overlay.jpg"),
+                    alpha=0.5,
+                )
         
         similarities = []
         for person_id, db_value in self.database.items():
@@ -193,18 +239,29 @@ class IrisInference:
 
             # One forward path to get embedding; compute similarities once
             img_tensor = self.preprocess_image(image_path, img_size=256)
-            mask = self.segment_iris(img_tensor)
+            mask = None
+            if not self.normalize:
+                mask = self.segment_iris(img_tensor)
             if save_masks_dir:
                 os.makedirs(save_masks_dir, exist_ok=True)
                 base = os.path.splitext(os.path.basename(image_path))[0]
-                self.save_segmentation(
-                    image_path,
-                    mask,
-                    out_mask_path=os.path.join(save_masks_dir, f"{base}_mask.png"),
-                    out_overlay_path=os.path.join(save_masks_dir, f"{base}_overlay.jpg"),
-                    alpha=0.5,
-                )
-            embedding = self.extract_embedding(img_tensor, mask, img_size=256)
+                if self.normalize and self._last_mask_orig is not None:
+                    self.save_segmentation(
+                        image_path,
+                        self._last_mask_orig,
+                        out_mask_path=os.path.join(save_masks_dir, f"{base}_mask.png"),
+                        out_overlay_path=os.path.join(save_masks_dir, f"{base}_overlay.jpg"),
+                        alpha=0.5,
+                    )
+                elif mask is not None:
+                    self.save_segmentation(
+                        image_path,
+                        mask,
+                        out_mask_path=os.path.join(save_masks_dir, f"{base}_mask.png"),
+                        out_overlay_path=os.path.join(save_masks_dir, f"{base}_overlay.jpg"),
+                        alpha=0.5,
+                    )
+            embedding = self.extract_embedding(img_tensor, mask, img_size=(self.norm_W if self.normalize else 256))
 
             similarities = []
             for pid_db, db_value in self.database.items():
@@ -295,12 +352,19 @@ def main():
     parser.add_argument('--top_k', type=int, default=5)
     parser.add_argument('--threshold', type=float, default=0.5)
     parser.add_argument('--save_masks_dir', type=str, help='Directory to save predicted masks and overlays (optional)')
+    # 归一化开关与尺寸
+    parser.add_argument('--normalize_iris', action='store_true', default=True, help='Normalize iris to pseudo-polar before embedding')
+    parser.add_argument('--norm_H', type=int, default=64, help='Iris normalization height (radial samples)')
+    parser.add_argument('--norm_W', type=int, default=256, help='Iris normalization width (angular samples)')
     
     args = parser.parse_args()
     
     inference = IrisInference(
         seg_model_path=args.seg_model,
-        recog_model_path=args.recog_model
+        recog_model_path=args.recog_model,
+        normalize=args.normalize_iris,
+        norm_H=args.norm_H,
+        norm_W=args.norm_W,
     )
     
     # 加载数据库
@@ -309,24 +373,11 @@ def main():
     
     # 查询
     if args.query_image:
-        # Also output mask visualization if requested
-        results = inference.query(args.query_image, args.top_k, args.threshold)
+        results = inference.query(args.query_image, args.top_k, args.threshold, save_masks_dir=args.save_masks_dir)
         print('\nQuery Results:')
         for i, result in enumerate(results):
             status = '✓' if result['matched'] else '✗'
             print(f'{i+1}. {status} {result["person_id"]}: {result["similarity"]:.4f}')
-        if args.save_masks_dir:
-            os.makedirs(args.save_masks_dir, exist_ok=True)
-            img_tensor = inference.preprocess_image(args.query_image, img_size=256)
-            mask = inference.segment_iris(img_tensor)
-            base = os.path.splitext(os.path.basename(args.query_image))[0]
-            inference.save_segmentation(
-                args.query_image,
-                mask,
-                out_mask_path=os.path.join(args.save_masks_dir, f"{base}_mask.png"),
-                out_overlay_path=os.path.join(args.save_masks_dir, f"{base}_overlay.jpg"),
-                alpha=0.5,
-            )
     elif args.query_dir:
         _ = inference.evaluate_directory(
             args.query_dir,
